@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  html, body { margin: 0; height: 100%; background: #ffffff; font-family: "Segoe UI", sans-serif; }
+  #wrap { position: relative; width: 100%; height: 560px; }
+  canvas { width: 100%; height: 100%; display: block; cursor: grab; background: #ffffff; }
+  canvas.dragging { cursor: grabbing; }
+  #tip {
+    position: absolute; display: none; max-width: 280px;
+    background: #16303A; color: #ffffff; padding: 6px 8px; border-radius: 4px;
+    font-size: 12px; line-height: 1.35; pointer-events: none; white-space: pre-line;
+  }
+  #legend {
+    position: absolute; top: 10px; right: 10px; background: rgba(255,255,255,0.94);
+    border: 1px solid #D5DEE3; border-radius: 6px; padding: 8px 10px; font-size: 12px;
+    color: #16303A;
+  }
+  .swatch { display: inline-block; width: 12px; height: 12px; border-radius: 50%; margin-right: 6px; vertical-align: -1px; border: 1px solid #5C6B73; }
+  .row { margin: 3px 0; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="cv"></canvas>
+  <div id="tip"></div>
+  <div id="legend">
+    <div class="row"><span class="swatch" style="background:#87CEEB"></span>Junction</div>
+    <div class="row"><span class="swatch" style="background:#FFD700"></span>Tank</div>
+    <div class="row"><span class="swatch" style="background:#FA8072"></span>Reservoir</div>
+    <div class="row"><span style="color:#DC143C">- -</span> Pump</div>
+    <div class="row"><span style="color:#0B6E99; font-size:16px; line-height:12px; vertical-align:-2px">◆</span> Valve</div>
+  </div>
+</div>
+<script>
+(function () {
+  function send(type, data) {
+    window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: type }, data || {}), "*");
+  }
+
+  var seq = 0;
+  var spec = { nodes: [], pipes: [], positions: {}, bends: {}, selected: null, fitToken: 0 };
+  var view = { cx: 0, cy: 0, scale: 220 };
+  var lastFit = null;
+  var drag = null;
+  var canvas = document.getElementById("cv");
+  var tip = document.getElementById("tip");
+  var ctx = canvas.getContext("2d");
+
+  function resize() {
+    var wrap = document.getElementById("wrap");
+    var dpr = window.devicePixelRatio || 1;
+    var w = wrap.clientWidth || 800;
+    var h = wrap.clientHeight || 560;
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    draw();
+  }
+
+  function cssSize() {
+    return { w: canvas.clientWidth || 800, h: canvas.clientHeight || 560 };
+  }
+
+  function toScreen(x, y) {
+    var size = cssSize();
+    return [
+      size.w / 2 + (x - view.cx) * view.scale,
+      size.h / 2 - (y - view.cy) * view.scale
+    ];
+  }
+
+  function toModel(sx, sy) {
+    var size = cssSize();
+    return [
+      view.cx + (sx - size.w / 2) / view.scale,
+      view.cy - (sy - size.h / 2) / view.scale
+    ];
+  }
+
+  function nodeById(id) {
+    for (var i = 0; i < spec.nodes.length; i++) {
+      if (spec.nodes[i].id === id) return spec.nodes[i];
+    }
+    return null;
+  }
+
+  function posOf(id) {
+    var p = spec.positions[id] || [0, 0];
+    return [Number(p[0]), Number(p[1])];
+  }
+
+  function curve(pipe) {
+    var a = posOf(pipe.start);
+    var b = posOf(pipe.end);
+    var dx = b[0] - a[0];
+    var dy = b[1] - a[1];
+    var len = Math.hypot(dx, dy) || 1;
+    var bend = Number(spec.bends[pipe.id] || 0);
+    var mx = (a[0] + b[0]) / 2;
+    var my = (a[1] + b[1]) / 2;
+    var control = [mx + (-dy / len) * bend * len, my + (dx / len) * bend * len];
+    var pts = [];
+    var n = 28;
+    for (var i = 0; i <= n; i++) {
+      var t = i / n;
+      var u = 1 - t;
+      pts.push([
+        u * u * a[0] + 2 * u * t * control[0] + t * t * b[0],
+        u * u * a[1] + 2 * u * t * control[1] + t * t * b[1]
+      ]);
+    }
+    return { pts: pts, control: control, a: a, b: b };
+  }
+
+  function screenPts(pts) {
+    return pts.map(function (p) { return toScreen(p[0], p[1]); });
+  }
+
+  function trim(screenPoints, radius) {
+    if (screenPoints.length < 2) return screenPoints;
+    var out = screenPoints.slice();
+    function clipEnd(fromStart) {
+      var i0 = fromStart ? 0 : out.length - 1;
+      var i1 = fromStart ? 1 : out.length - 2;
+      var origin = out[i0];
+      var next = out[i1];
+      var dx = next[0] - origin[0];
+      var dy = next[1] - origin[1];
+      var len = Math.hypot(dx, dy) || 1;
+      out[i0] = [origin[0] + dx / len * radius, origin[1] + dy / len * radius];
+    }
+    clipEnd(true);
+    clipEnd(false);
+    return out;
+  }
+
+  function distToPoly(px, py, pts) {
+    var best = 1e9;
+    for (var i = 0; i < pts.length - 1; i++) {
+      var ax = pts[i][0], ay = pts[i][1];
+      var bx = pts[i + 1][0], by = pts[i + 1][1];
+      var dx = bx - ax, dy = by - ay;
+      var len2 = dx * dx + dy * dy || 1;
+      var t = Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / len2));
+      var qx = ax + t * dx, qy = ay + t * dy;
+      best = Math.min(best, Math.hypot(px - qx, py - qy));
+    }
+    return best;
+  }
+
+  function hit(sx, sy) {
+    var nodes = spec.nodes;
+    for (var i = nodes.length - 1; i >= 0; i--) {
+      var sp = toScreen(posOf(nodes[i].id)[0], posOf(nodes[i].id)[1]);
+      if (Math.hypot(sx - sp[0], sy - sp[1]) <= 16) {
+        return { kind: "node", id: nodes[i].id };
+      }
+    }
+    var pipes = spec.pipes;
+    for (var p = 0; p < pipes.length; p++) {
+      var geom = curve(pipes[p]);
+      var handle = toScreen(geom.control[0], geom.control[1]);
+      var selected = spec.selected && spec.selected.kind === "pipe" && spec.selected.id === pipes[p].id;
+      if (selected && Math.hypot(sx - handle[0], sy - handle[1]) <= 9) {
+        return { kind: "handle", id: pipes[p].id };
+      }
+      var pts = trim(screenPts(geom.pts), 16);
+      if (distToPoly(sx, sy, pts) <= 8) {
+        return { kind: "pipe", id: pipes[p].id };
+      }
+    }
+    return null;
+  }
+
+  function drawArrow(from, to, color) {
+    var angle = Math.atan2(to[1] - from[1], to[0] - from[0]);
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.moveTo(to[0], to[1]);
+    ctx.lineTo(to[0] - 11 * Math.cos(angle - 0.4), to[1] - 11 * Math.sin(angle - 0.4));
+    ctx.lineTo(to[0] - 11 * Math.cos(angle + 0.4), to[1] - 11 * Math.sin(angle + 0.4));
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  function drawValve(at) {
+    ctx.save();
+    ctx.translate(at[0], at[1]);
+    ctx.beginPath();
+    ctx.moveTo(0, -10); ctx.lineTo(10, 0); ctx.lineTo(0, 10); ctx.lineTo(-10, 0);
+    ctx.closePath();
+    // White halo first so the diamond stands out from the pipe line under it.
+    ctx.strokeStyle = "#ffffff";
+    ctx.lineWidth = 4;
+    ctx.stroke();
+    ctx.fillStyle = "#0B6E99";
+    ctx.fill();
+    ctx.strokeStyle = "#16303A";
+    ctx.lineWidth = 1.2;
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function fmt(value, unit) {
+    if (value === null || value === undefined || value === "") return "not set";
+    return String(value) + " " + unit;
+  }
+
+  function tooltipFor(target) {
+    if (!target) return "";
+    if (target.kind === "node") {
+      var node = nodeById(target.id);
+      if (!node) return "";
+      var lines = [node.id + "  " + node.type, "Elevation: " + fmt(node.elevation, "m")];
+      if (node.type === "reservoir") lines.push("Head: " + fmt(node.head, "m"));
+      if (node.type === "tank") lines.push("Capacity: " + fmt(node.capacity, "m³"));
+      return lines.join("\n");
+    }
+    var pipe = null;
+    for (var i = 0; i < spec.pipes.length; i++) {
+      if (spec.pipes[i].id === target.id) pipe = spec.pipes[i];
+    }
+    if (!pipe) return "";
+    var lines = [pipe.id + "  " + pipe.start + " → " + pipe.end];
+    if (pipe.has_pump) lines.push("Pump: " + fmt(pipe.pump_power, "kW"));
+    lines.push("Length: " + fmt(pipe.length, "m"));
+    lines.push("Diameter: " + fmt(pipe.diameter, "m"));
+    lines.push("Roughness: " + fmt(pipe.roughness, "m"));
+    if (pipe.valve_start) lines.push("Valve at start");
+    if (pipe.valve_end) lines.push("Valve at end");
+    return lines.join("\n");
+  }
+
+  function draw() {
+    var size = cssSize();
+    ctx.clearRect(0, 0, size.w, size.h);
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, size.w, size.h);
+    if (!spec.nodes.length) {
+      ctx.fillStyle = "#5C6B73";
+      ctx.font = "15px Segoe UI, sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText("Add a junction, tank, or reservoir to start the network.", size.w / 2, size.h / 2);
+      return;
+    }
+
+    spec.pipes.forEach(function (pipe) {
+      var geom = curve(pipe);
+      var pts = trim(screenPts(geom.pts), 16);
+      var selected = spec.selected && spec.selected.kind === "pipe" && spec.selected.id === pipe.id;
+      ctx.beginPath();
+      ctx.moveTo(pts[0][0], pts[0][1]);
+      for (var i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+      ctx.strokeStyle = selected ? "#0078D7" : (pipe.has_pump ? "#DC143C" : "#333333");
+      ctx.lineWidth = selected ? 3.5 : 2;
+      ctx.setLineDash(pipe.has_pump ? [7, 5] : []);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      if (pts.length > 4) {
+        drawArrow(pts[pts.length - 4], pts[pts.length - 1], selected ? "#0078D7" : (pipe.has_pump ? "#DC143C" : "#333333"));
+      }
+      if (pipe.valve_start) drawValve(pts[Math.max(1, Math.floor(pts.length * 0.18))]);
+      if (pipe.valve_end) drawValve(pts[Math.min(pts.length - 2, Math.floor(pts.length * 0.72))]);
+      var mid = pts[Math.floor(pts.length / 2)];
+      ctx.fillStyle = "#16303A";
+      ctx.font = "12px Segoe UI, sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText(pipe.has_pump ? pipe.id + " (" + pipe.pump_power + " kW)" : pipe.id, mid[0], mid[1] - 8);
+      if (selected) {
+        var handle = toScreen(geom.control[0], geom.control[1]);
+        ctx.beginPath();
+        ctx.arc(handle[0], handle[1], 6, 0, Math.PI * 2);
+        ctx.fillStyle = "#ffffff";
+        ctx.fill();
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = "#0078D7";
+        ctx.stroke();
+      }
+    });
+
+    spec.nodes.forEach(function (node) {
+      var sp = toScreen(posOf(node.id)[0], posOf(node.id)[1]);
+      var selected = spec.selected && spec.selected.kind === "node" && spec.selected.id === node.id;
+      ctx.beginPath();
+      ctx.arc(sp[0], sp[1], 15, 0, Math.PI * 2);
+      ctx.fillStyle = node.type === "tank" ? "#FFD700" : (node.type === "reservoir" ? "#FA8072" : "#87CEEB");
+      ctx.fill();
+      ctx.lineWidth = selected ? 3 : 1.5;
+      ctx.strokeStyle = selected ? "#0078D7" : "#35515C";
+      ctx.stroke();
+      ctx.fillStyle = "#16303A";
+      ctx.font = "12px Segoe UI, sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText(node.id, sp[0], sp[1] + 28);
+    });
+  }
+
+  function fit() {
+    if (!spec.nodes.length) return;
+    var xs = [], ys = [];
+    spec.nodes.forEach(function (node) {
+      var p = posOf(node.id);
+      xs.push(p[0]); ys.push(p[1]);
+    });
+    var minX = Math.min.apply(null, xs), maxX = Math.max.apply(null, xs);
+    var minY = Math.min.apply(null, ys), maxY = Math.max.apply(null, ys);
+    view.cx = (minX + maxX) / 2;
+    view.cy = (minY + maxY) / 2;
+    var size = cssSize();
+    var spanX = Math.max(maxX - minX, 0.4);
+    var spanY = Math.max(maxY - minY, 0.4);
+    view.scale = Math.max(80, Math.min(size.w / (spanX + 0.8), size.h / (spanY + 0.8), 420));
+  }
+
+  function emit(action, extra) {
+    seq += 1;
+    send("streamlit:setComponentValue", {
+      value: Object.assign({ seq: seq, action: action }, extra || {}),
+      dataType: "json"
+    });
+  }
+
+  function positionsPayload() {
+    var out = {};
+    spec.nodes.forEach(function (node) { out[node.id] = posOf(node.id); });
+    return out;
+  }
+
+  canvas.addEventListener("mousedown", function (event) {
+    var rect = canvas.getBoundingClientRect();
+    var sx = event.clientX - rect.left;
+    var sy = event.clientY - rect.top;
+    var target = hit(sx, sy);
+    drag = {
+      sx: sx, sy: sy, moved: false,
+      target: target,
+      model: toModel(sx, sy),
+      startPositions: JSON.parse(JSON.stringify(spec.positions)),
+      startBend: target && target.kind === "handle" ? Number(spec.bends[target.id] || 0) : 0
+    };
+    canvas.classList.add("dragging");
+  });
+
+  window.addEventListener("mousemove", function (event) {
+    var rect = canvas.getBoundingClientRect();
+    var sx = event.clientX - rect.left;
+    var sy = event.clientY - rect.top;
+    if (!drag) {
+      var hover = (sx >= 0 && sy >= 0 && sx <= rect.width && sy <= rect.height) ? hit(sx, sy) : null;
+      var text = tooltipFor(hover && hover.kind !== "handle" ? hover : null);
+      if (text) {
+        tip.style.display = "block";
+        tip.textContent = text;
+        tip.style.left = Math.min(sx + 14, rect.width - 240) + "px";
+        tip.style.top = (sy + 16) + "px";
+      } else {
+        tip.style.display = "none";
+      }
+      return;
+    }
+    if (Math.hypot(sx - drag.sx, sy - drag.sy) > 3) drag.moved = true;
+    var model = toModel(sx, sy);
+    if (!drag.target) {
+      view.cx -= model[0] - drag.model[0];
+      view.cy -= model[1] - drag.model[1];
+    } else if (drag.target.kind === "node") {
+      spec.positions[drag.target.id] = [model[0], model[1]];
+      spec.selected = { kind: "node", id: drag.target.id };
+    } else if (drag.target.kind === "handle") {
+      var pipe = spec.pipes.filter(function (p) { return p.id === drag.target.id; })[0];
+      if (pipe) {
+        var a = posOf(pipe.start), b = posOf(pipe.end);
+        var dx = b[0] - a[0], dy = b[1] - a[1];
+        var len = Math.hypot(dx, dy) || 1;
+        var mx = (a[0] + b[0]) / 2, my = (a[1] + b[1]) / 2;
+        var nx = -dy / len, ny = dx / len;
+        var bend = ((model[0] - mx) * nx + (model[1] - my) * ny) / len;
+        bend = Math.max(-0.8, Math.min(0.8, bend));
+        spec.bends[pipe.id] = bend;
+      }
+    }
+    draw();
+  });
+
+  window.addEventListener("mouseup", function () {
+    if (!drag) return;
+    var target = drag.target;
+    var moved = drag.moved;
+    canvas.classList.remove("dragging");
+    drag = null;
+    tip.style.display = "none";
+    if (!target) {
+      if (!moved) emit("clear", {});
+      return;
+    }
+    if (target.kind === "node" && moved) {
+      emit("move", { positions: positionsPayload(), kind: "node", id: target.id });
+      return;
+    }
+    if (target.kind === "handle" && moved) {
+      emit("bend", { bends: spec.bends, kind: "pipe", id: target.id });
+      return;
+    }
+    if (target.kind === "handle") return;
+    var kind = target.kind === "node" ? "node" : "pipe";
+    spec.selected = { kind: kind, id: target.id };
+    draw();
+    emit("select", { kind: kind, id: target.id });
+  });
+
+  canvas.addEventListener("dblclick", function (event) {
+    var rect = canvas.getBoundingClientRect();
+    var target = hit(event.clientX - rect.left, event.clientY - rect.top);
+    if (target && target.kind === "handle") {
+      spec.bends[target.id] = 0;
+      draw();
+      emit("bend", { bends: spec.bends, kind: "pipe", id: target.id });
+    }
+  });
+
+  canvas.addEventListener("wheel", function (event) {
+    // Plain wheel scrolls the page; Ctrl/Cmd + wheel (and trackpad pinch,
+    // which browsers report as Ctrl + wheel) zooms the network.
+    if (!event.ctrlKey && !event.metaKey) return;
+    event.preventDefault();
+    var rect = canvas.getBoundingClientRect();
+    var sx = event.clientX - rect.left;
+    var sy = event.clientY - rect.top;
+    var before = toModel(sx, sy);
+    var factor = event.deltaY < 0 ? 1.1 : 0.9;
+    view.scale = Math.max(40, Math.min(900, view.scale * factor));
+    var after = toModel(sx, sy);
+    view.cx += before[0] - after[0];
+    view.cy += before[1] - after[1];
+    draw();
+  }, { passive: false });
+
+  window.addEventListener("message", function (event) {
+    var data = event.data || {};
+    if (data.type !== "streamlit:render") return;
+    var args = data.args || {};
+    spec = args.spec || spec;
+    spec.nodes = spec.nodes || [];
+    spec.pipes = spec.pipes || [];
+    spec.positions = spec.positions || {};
+    spec.bends = spec.bends || {};
+    if (!drag && spec.fitToken !== lastFit) {
+      lastFit = spec.fitToken;
+      fit();
+    }
+    if (!drag) draw();
+  });
+
+  window.addEventListener("resize", resize);
+  send("streamlit:componentReady", { apiVersion: 1 });
+  send("streamlit:setFrameHeight", { height: 560 });
+  resize();
+})();
+</script>
+</body>
+</html>
