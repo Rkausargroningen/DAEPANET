@@ -1,7 +1,6 @@
-numpy==2.2.3
+ numpy==2.2.3
 networkx==3.4.2
 matplotlib==3.10.1
-PySide6==6.11.2
 streamlit>=1.44
 pandas>=2.2
 epyt>=1.1.0
